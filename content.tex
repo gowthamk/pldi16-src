@@ -1,0 +1,230 @@
+\section{Introduction}
+
+Ruby-on-Rails, a web programming framework written in Ruby, has gained
+wide adoption among Web 2.0 applications, such as Twitter, Airbnb,
+Hulu, Groupon, and SoundCloud.  One of the factors that led to the
+success of Rails framework is its singular focus on facilitating the
+expression of complex web functionality via succint code. For
+instance, Selfstarter~\cite{selfstarter}, a popular Rails application
+that implements end-to-end functionality of a crowdfunding site,
+including the integration with Amazon Payments, was implemented in
+less than 600 lines of Ruby. While Rails's philosophy of prioritizing
+``convention over configuration''~\cite{railsphilosophy} contributes
+to its expressivity, the main facilitator, however, is the
+meta-programming support offered by Ruby that enables rich
+functionality, such as reflection, run-time code generation, singleton
+objects, and also the much-maligned \emph{eval}~\cite{eval} function.  
+
+Indeed, meta-programming features are available in many mainstream
+languages~\cite{MetaOCaml, LMS}. However, their usage in mainstream
+programming is not as prevalent as it is in Ruby. For example, the
+idiomatic way to write a \C{Rectangle} class in Ruby is to rely on the
+inbuilt \C{attr\_accessor} meta-function to introduce fields named
+\C{length} and \C{breadth}, and define their setters and getters:
+\begin{coderuby}
+class Rectangle
+  attr_accessor :length, :breadth
+end
+\end{coderuby}
+Moreover, unlike the static languages, where meta-functions are
+``evaluated away'' at the compile time, Ruby is unapolegetically
+dynamic (no just-in-time compilation; all code is interpreted at
+run-time), and makes no distinction between object-level code and
+meta-level code. The dynamic nature of Ruby complicates the task of
+building formal analyses for the language, which perhaps explains why
+there are relatively few proposals for static analysis of Ruby code,
+despite the language not being inherently safer than other dynamic
+languages.
+
+In this paper, we propose \name, a lightweight symbolic execution
+framework for Ruby that also performs partial evaluation. \name
+accepts a Ruby program, complete with meta-functions and their
+applications, as its input, emits an equivalent Ruby
+program\footnote{We do not yet have a formal proof for this claim.},
+where all applications of meta-level functions are evaluated away. The
+language of the generated program is a small subset of Ruby that is
+amenable to static analysis. \name thus simplifies the task of
+building static analyses for Ruby by preempting the need to reason
+about meta features in an analysis-specific way. \name is lightweight
+in the sense that it a language library (a Ruby ``gem'') rather than a
+language implementation. \name was designed to coexist with an
+unmodified Rails library, and rely on a concrete Ruby interpreter to
+perform symbolic execution. We believe that this choice is appropriate
+for a fast-evolving language like Ruby, where the semantics of the
+language are only vaguely defined.
+
+Chaudhuri and Foster~\cite{Rubyx} have previously proposed a symbolic
+execution for Ruby-on-Rails tailor-made for their security analysis.
+Their approach relies on a custom-built symbolic interpreter that
+generates verification conditions. To the best of our knowledge, \name
+is the first symbolic execution engine for Ruby-on-Rails that works
+off an off-the-shelf interpreter, and generates Ruby code that can be
+consumed by other analyses.
+
+\section{Motivating Example}
+\begin{figure}
+  \begin{coderuby}
+  class Micropost < ActiveRecord::Base
+    belongs_to :user
+    validates :content, presence: true, 
+              length: { maximum: 140 }
+    validates :user, presence: true
+    # Some methods
+    # ...
+  end
+  \end{coderuby}
+\label{fig:postSave}
+\caption{Micropost class (model) of Microblog Rails Application}
+\end{figure}
+
+\begin{figure}
+  \begin{coderuby}
+def save(post)
+  v0 := post.id
+  v1 := post.content
+  v2 := post.user_id
+  SQL (begin transaction)
+  v6 := (v1.length)<=140
+  if (v6==true) then
+    v7 := SQL (SELECT  "users".* FROM "users"  
+                WHERE "users"."id" = v2)
+    v9 := v7.map do |v8|
+      {id => v8.id, name => v8.name}
+    end
+    v10 = v9.first
+    v11 = v10==nil
+    if (v11==true) then
+      SQL (rollback transaction)
+    else
+      v12 := SQL (INSERT INTO "microposts" VALUES (v1, v0, v2))
+      SQL (commit transaction)
+    end
+  else
+    SQL (rollback transaction)
+  end
+end
+  \end{coderuby}
+
+\label{fig:addPost}
+\caption{Micropost class (model) of Microblog Rails Application}
+\end{figure}
+
+Fig.~\ref{fig:postSave} shows the implementation of \C{Micropost}
+class taken from a Microblogging application developed using
+Rails~\cite{sampleapp}. The class extends Rails's
+\C{ActiveRecord::Base} class which implements Rails's
+Object-Relational Mapping (ORM) system. Almost the entire
+functionality of \C{Micropost} class was implemented using
+meta-functions offered by \C{ActiveRecord::Base}. For example, instead
+of implementing a custom logic to save a post to the database,
+\C{Micropost} class relies on the generic \C{save} method provided
+by\C{Base} class of \C{ActiveRecord}, but customizes it by specifying
+additional constraints via the meta-function \C{validates}. The result
+is a \C{save} method that performs additional checks (for eg., content
+length $\le$ 140 characters) before saving the post to the database.
+However, the customized \C{save} method never really exists; it's
+logic is generated on-the-fly when the \C{save} method is called on a
+concrete \C{Micropost} object. This makes it difficult for humans to
+understand the program, and for the analyses to verify it.
+
+\name runs the \C{save} method of \C{Micropost} on a symbolic input,
+and generates its new definition as shown in Fig.~\ref{fig:addPost}
+(simplified for clarity).  Observe that the generated definition has
+no meta-function applications, is self-contained, and easier to
+understand and analyze.
+
+\section{Key Ideas Underlying \name}
+
+% \begin{figure}
+% \begin{coderuby}
+% class SymbolicInteger < SymbolicValue
+%   def +(other)
+%     bin_op_exp = SymbolicAST::BinOp.new(self.ast,'+',other)
+%     var = tracer.new_var_for(bool_op_exp)
+%     return SymbolicInteger.new (var)
+%   end
+% end
+% \end{coderuby}
+% \label{fig:sym-int}
+% \caption{Symbolic Integer in \name}
+% \end{figure}
+
+\name is based on some fundamental observations about Ruby in general,
+and Ruby-on-Rails in particular. First, unlike in multi-stage
+programming, Ruby has no stratification of the code that consumes
+application's inputs and the code that consumes the application
+itself. Under this context, symbolic execution is an effective partial
+evaluation technique. Second, Ruby adopts \emph{duck typing}, meaning
+that it does not distinguish between two objects that respond to same
+messages (method calls), even when they are constructed from different
+classes. This applies even to the objects of core types, such as
+integers and strings. Consequently, a Ruby function expecting a
+concrete integer input can instead be run on a symbolic integer as
+long as the later behaves like the former\footnote{This is only true
+as long as the control does not escape the boundary of Ruby and C, the
+language in which certain core functionality is implemented.}. To
+exploit this observation, \name framework defines symbolic
+counterparts of all core classes that respond to the same methods as
+core classes. However, instead of a concrete result, the symbolic
+methods return new symbolic values, which may then flow into other
+(symbolic or concrete) methods. \name assigns a unique symbolic AST
+node to each symbolic value, and traces (i.e., logs to trace) the
+relationship between new symbolic AST nodes and existing nodes. Third,
+Ruby's reflection features allow control over class and method
+bindings at the run-time (Even those of core types\footnote{\C{a+b} is
+treated as \C{a.+(b)} in Ruby. This is a problem if \C{a} is concrete
+and \C{b} is symbolic. To circumvent this problem, We override (at
+run-time) the definition of concrete integer addition method so as to
+treat \C{a+b} as \C{b+a}.}). Coupled with the fact that ``all data are
+objects'' and ``all control are method applications'' in Ruby, the
+semantics of any application can be controlled from the appliction
+space itself. 
+
+In \name, symbolic methods that are expected to return either \C{true}
+or \C{false} do so by initially making an ambivalent choice, and later
+backtracking to explore the other choice. For this purpose, we
+implement an \C{amb} function similar to McCarthy's
+\C{amb}~\cite{amb}, except that our \C{amb} relies on Unix processes
+rather than continuations to checkpoint and restore the
+state~\cite{StackOverflow}. Unix processes are needed because
+restoring a stored continuation does not rollback side-effects on
+heap. Whenever we make an ambivalent choice in method \C{f} of a
+symbolic value \C{v}, we write an \C{if} expression to the trace (eg.,
+\C{if (v.f() == true) then ...  end }).  The symbolic execution
+continues in a new (child) process, tracing under the \C{then} branch,
+while the parent process waits.  Once the child process returns, the
+parent process resumes execution, assuming \C{v.f()} as \C{false}, and
+traces under the \C{else} branch. While this approach does not
+generalize to arbitrary loops, such loops are very rare in Ruby. The
+idiomatic way to write a loop in Ruby is to use a higher-order
+combinator, such as \C{map} and \C{each} on arrays, and \C{times} on
+integer (for eg., \C{n.times {f()}} will execute \C{f()} \C{n} times).
+Since higher-order combinators are methods, they too can be traced and
+made to return a symbolic value, just like other methods. 
+
+The result of symbolic execution is a trace that contains a slice
+of the original program that is data-dependent on its inputs. Any
+interactions with the environment (eg., database I/O) are also traced,
+given that such interactions happen via a symbolic adapter. 
+
+\section{Implementation and Experiments}
+
+\name is implemented as a Ruby library that works on top of an
+off-the-shelf Ruby interpreter (We used MRI~\cite{MRI} for
+development). From an engineering perspective, leveraging an
+off-the-shelf Ruby interpreter and relying on Unix processes for heap
+checkpointing and restoration enabled an implementation comprising
+rougly only 1300 lines of Ruby code, packaged as a Ruby
+gem\footnote{Source code available at
+\url{https://github.com/gowthamk/conflict_analysis}}.
+
+We used \name to compute summaries of various operations supported by
+applications similar to the one described in \S~\ref{sec:motivation}.
+Although the complexity being exponential in terms on number of
+branches, \name was able to compute method summaries within 2s. 
+
+It is conjectured that the Ruby code generated by name runs faster
+than the original code that involves calls to meta-functions. We have
+not tested this hypothesis, and we plan to explore this direction in
+the near future.
+
